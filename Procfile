@@ -1,1 +1,1 @@
-Miauy.py: python bot.py
+bot: python Miauy.py
