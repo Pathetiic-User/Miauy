@@ -1,2 +1,1 @@
-bot: python bot.py
-updater: python updater.py
+Miauy.py: python bot.py
