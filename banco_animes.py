@@ -26,15 +26,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Contadores para monitoramento (resetados por ciclo)
+total_errors = 0
+total_traduzidos = 0
+start_time = None
+
 # Carregar configurações de arquivo ou argumentos
 def load_config():
     parser = argparse.ArgumentParser(description='Anime Scraper Configuration')
     parser.add_argument('--max-workers', type=int, default=3, help='Número máximo de workers para requisições paralelas')
-    parser.add_argument('--request-delay', type=float, default=0.35, help='Delay inicial entre requisições em segundos')
+    parser.add_argument('--request-delay', type=float, default=0.35, help='Delay entre requisições em segundos')
     parser.add_argument('--config-file', type=str, default='config.json', help='Arquivo de configuração')
     args = parser.parse_args()
 
-    # Carregar variável de ambiente necessária
+    # Carregar variáveis de ambiente necessárias
     database_url = os.getenv('DATABASE_URL')
     
     if not database_url:
@@ -48,7 +53,7 @@ def load_config():
         'MAX_RETRIES': 3,
         'PROGRESS_FILE': "progress.json",
         'TIMEOUT': 15,
-        'MAX_BACKOFF': 60  # Máximo tempo de espera para backoff exponencial
+        'BACKOFF_BASE_DELAY': 2.0  # Delay base para backoff exponencial em 429
     }
 
     if os.path.exists(args.config_file):
@@ -73,7 +78,7 @@ REQUEST_DELAY = CONFIG['REQUEST_DELAY']
 PROGRESS_FILE = CONFIG['PROGRESS_FILE']
 MAX_WORKERS = CONFIG['MAX_WORKERS']
 TIMEOUT = CONFIG['TIMEOUT']
-MAX_BACKOFF = CONFIG['MAX_BACKOFF']
+BACKOFF_BASE_DELAY = CONFIG['BACKOFF_BASE_DELAY']
 
 translator = GoogleTranslator(source='auto', target=LANGUAGE)
 
@@ -303,11 +308,21 @@ def fetch_anime_page(page, retries=MAX_RETRIES, timeout=TIMEOUT):
     url = f"https://api.jikan.moe/v4/anime?page={page}"
     dynamic_delay = REQUEST_DELAY
     
+    # Configura os headers com User-Agent básico
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     for attempt in range(retries):
         try:
             response = requests.get(url, headers=headers, timeout=timeout)
+            
+            # Verificação específica para 429 (Too Many Requests)
+            if response.status_code == 429:
+                wait_time = BACKOFF_BASE_DELAY * (2 ** attempt)  # Backoff exponencial para 429
+                wait_time = min(wait_time, 60)  # Máximo 60s
+                logger.warning(f"Rate limit excedido (429). Aguardando {wait_time}s (tentativa {attempt+1}/{retries})...")
+                time.sleep(wait_time)
+                continue
+            
             response.raise_for_status()
             
             # Log de rate limit
@@ -320,29 +335,26 @@ def fetch_anime_page(page, retries=MAX_RETRIES, timeout=TIMEOUT):
                 
                 # Ajusta o delay dinamicamente com base no rate limit
                 if remaining < 5:
-                    dynamic_delay = min(dynamic_delay * 2, MAX_BACKOFF)
+                    dynamic_delay = min(dynamic_delay * 2, 10)  # Aumenta o delay, máximo 10s
                     logger.warning(f"Rate limit baixo ({remaining}). Aumentando delay para {dynamic_delay}s")
                 elif remaining > 30:
-                    dynamic_delay = max(dynamic_delay * 0.75, 0.1)
+                    dynamic_delay = max(dynamic_delay * 0.75, 0.1)  # Reduz o delay, mínimo 0.1s
                     logger.info(f"Rate limit alto ({remaining}). Reduzindo delay para {dynamic_delay}s")
             
             # Processa a resposta
             data = response.json()
             return data.get('data', []), data.get('pagination', {}), dynamic_delay
             
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:  # Too Many Requests
-                backoff = min(2 ** attempt * REQUEST_DELAY, MAX_BACKOFF)
-                logger.warning(f"Erro 429 (Too Many Requests) na página {page}. Aguardando {backoff}s antes de tentar novamente...")
-                time.sleep(backoff)
-            else:
-                logger.error(f"Erro HTTP na requisição (tentativa {attempt+1}/{retries}): {e}")
-                if attempt < retries - 1:
-                    time.sleep(5 * (attempt + 1))
         except requests.exceptions.RequestException as e:
-            logger.error(f"Erro na requisição (tentativa {attempt+1}/{retries}): {e}")
-            if attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
+            global total_errors
+            total_errors += 1
+            logger.error(f"Erro na requisição para página {page} (tentativa {attempt+1}/{retries}): {e}")
+            if attempt < retries - 1:  # Não dormir após a última tentativa
+                # Backoff exponencial suave para outros erros
+                wait_time = 1 * (2 ** attempt)
+                wait_time = min(wait_time, 30)  # Máximo 30s
+                logger.info(f"Aguardando {wait_time} segundos antes de tentar novamente...")
+                time.sleep(wait_time)
     return None, None, dynamic_delay
 
 def validate_anime_data(anime):
@@ -409,7 +421,7 @@ def process_anime(anime):
         members = anime.get('members')
         favorites = anime.get('favorites')
         synopsis = anime.get('synopsis')
-        synopsis_pt = None  # Tradução de synopsis desativada
+        synopsis_pt = None  # Inicialmente None; tradução será feita depois se necessário
         background = anime.get('background')
         premiered = anime.get('premiered')
         broadcast = anime.get('broadcast', {}).get('string')
@@ -452,4 +464,285 @@ def process_anime(anime):
         
         params = (
             mal_id, title, title_english, title_japanese, title_synonyms,
-            type_, source, episodes
+            type_, source, episodes, status, status_pt, airing,
+            aired_from, aired_to, duration, rating,
+            score, scored_by, rank, popularity, members, favorites,
+            synopsis, synopsis_pt, background,
+            premiered, broadcast,
+            url, images, trailer,
+            producers, licensors, studios, genres, explicit_genres, themes, demographics,
+            relations,
+            approved, season, season_pt, year,
+            image_url
+        )
+        return params
+    except Exception as e:
+        logger.error(f"Erro ao processar anime {anime.get('mal_id', 'unknown')}: {e}")
+        return None
+
+def process_anime_batch(animes_batch):
+    """Processa um lote de animes e retorna os parâmetros para inserção em lote"""
+    params_batch = []
+    mal_ids = []  # Para rastrear IDs do batch
+    for anime in animes_batch:
+        params = process_anime(anime)
+        if params:
+            mal_id = params[0]  # Primeiro param é mal_id
+            params_batch.append(params)
+            mal_ids.append(mal_id)
+    return params_batch, mal_ids
+
+def insert_anime_batch(params_batch):
+    """Insere um lote de animes no banco de dados"""
+    if not params_batch:
+        return 0
+        
+    query = """
+    INSERT INTO animes (
+        mal_id, title, title_english, title_japanese, title_synonyms,
+        type, source, episodes, status, status_pt, airing,
+        aired_from, aired_to, duration, rating,
+        score, scored_by, rank, popularity, members, favorites,
+        synopsis, synopsis_pt, background,
+        premiered, broadcast,
+        url, images, trailer,
+        producers, licensors, studios, genres, explicit_genres, themes, demographics,
+        relations,
+        approved, season, season_pt, year,
+        image_url
+    ) VALUES (
+        %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s,
+        %s, %s, %s,
+        %s, %s,
+        %s, %s, %s,
+        %s, %s, %s, %s, %s, %s, %s,
+        %s,
+        %s, %s, %s, %s,
+        %s
+    )
+    ON CONFLICT (mal_id) DO UPDATE SET
+        title = EXCLUDED.title,
+        title_english = EXCLUDED.title_english,
+        title_japanese = EXCLUDED.title_japanese,
+        title_synonyms = EXCLUDED.title_synonyms,
+        type = EXCLUDED.type,
+        source = EXCLUDED.source,
+        episodes = EXCLUDED.episodes,
+        status = EXCLUDED.status,
+        status_pt = EXCLUDED.status_pt,
+        airing = EXCLUDED.airing,
+        aired_from = EXCLUDED.aired_from,
+        aired_to = EXCLUDED.aired_to,
+        duration = EXCLUDED.duration,
+        rating = EXCLUDED.rating,
+        score = EXCLUDED.score,
+        scored_by = EXCLUDED.scored_by,
+        rank = EXCLUDED.rank,
+        popularity = EXCLUDED.popularity,
+        members = EXCLUDED.members,
+        favorites = EXCLUDED.favorites,
+        synopsis = EXCLUDED.synopsis,
+        synopsis_pt = CASE WHEN animes.synopsis_pt IS NOT NULL THEN animes.synopsis_pt ELSE EXCLUDED.synopsis_pt END,
+        background = EXCLUDED.background,
+        premiered = EXCLUDED.premiered,
+        broadcast = EXCLUDED.broadcast,
+        url = EXCLUDED.url,
+        images = EXCLUDED.images,
+        trailer = EXCLUDED.trailer,
+        producers = EXCLUDED.producers,
+        licensors = EXCLUDED.licensors,
+        studios = EXCLUDED.studios,
+        genres = EXCLUDED.genres,
+        explicit_genres = EXCLUDED.explicit_genres,
+        themes = EXCLUDED.themes,
+        demographics = EXCLUDED.demographics,
+        relations = EXCLUDED.relations,
+        approved = EXCLUDED.approved,
+        season = EXCLUDED.season,
+        season_pt = EXCLUDED.season_pt,
+        year = EXCLUDED.year,
+        image_url = EXCLUDED.image_url,
+        updated_at = NOW()
+    """
+    
+    try:
+        cursor.executemany(query, params_batch)
+        conn.commit()
+        logger.info(f"Inseridos {len(params_batch)} animes com sucesso.")
+        return len(params_batch)
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Erro ao inserir lote de {len(params_batch)} animes: {e}")
+        return 0
+
+def update_synopsis_batch(mal_ids, animes_batch):
+    """Atualiza synopsis_pt para animes no batch se for NULL e tiver synopsis"""
+    global total_traduzidos
+    traduzidos = 0
+    # Criar dicionário com mal_id e synopsis, apenas para animes com synopsis não nulo
+    mal_id_to_synopsis = {anime['mal_id']: anime.get('synopsis') 
+                         for anime in animes_batch 
+                         if anime.get('mal_id') and anime.get('synopsis') is not None}
+    
+    logger.info(f"Verificando traduções para {len(mal_ids)} animes no batch")
+    pendentes = 0
+    pulados = 0
+    sem_synopsis = 0
+    
+    for mal_id in mal_ids:
+        try:
+            # Checar se synopsis_pt é NULL
+            cursor.execute("SELECT synopsis_pt FROM animes WHERE mal_id = %s;", (mal_id,))
+            result = cursor.fetchone()
+            if result and result[0] is None:
+                synopsis = mal_id_to_synopsis.get(mal_id)
+                if synopsis is not None:
+                    pendentes += 1
+                    synopsis_pt = safe_translate(synopsis)
+                    if synopsis_pt:
+                        cursor.execute("""
+                            UPDATE animes SET synopsis_pt = %s, updated_at = NOW() WHERE mal_id = %s;
+                        """, (synopsis_pt, mal_id))
+                        conn.commit()
+                        logger.info(f"Traduzindo synopsis para anime {mal_id}")
+                        traduzidos += 1
+                        total_traduzidos += 1
+                    else:
+                        logger.warning(f"Falha na tradução para anime {mal_id}")
+                else:
+                    sem_synopsis += 1
+                    logger.debug(f"Synopsis ausente para anime {mal_id}")
+            else:
+                pulados += 1
+                logger.debug(f"Synopsis já traduzida para anime {mal_id}")
+        except Exception as e:
+            logger.error(f"Erro ao atualizar synopsis para anime {mal_id}: {e}")
+    
+    logger.info(f"Batch: {traduzidos} animes traduzidos, {pendentes} pendentes processados, "
+                f"{pulados} já traduzidos, {sem_synopsis} sem sinopse para traduzir")
+    return traduzidos
+
+def fetch_pages_parallel(pages):
+    """Fetch múltiplas páginas em paralelo com limite de workers"""
+    all_animes = []
+    all_pagination = None
+    dynamic_delay = REQUEST_DELAY
+    batch_errors = 0  # Erros neste batch
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_page = {executor.submit(fetch_anime_page, page): page for page in pages}
+        for future in as_completed(future_to_page):
+            page = future_to_page[future]
+            try:
+                animes, pagination, new_delay = future.result()
+                dynamic_delay = new_delay
+                if animes:
+                    all_animes.extend(animes)
+                    if not all_pagination:
+                        all_pagination = pagination
+                logger.info(f"Página {page} fetchada: {len(animes) if animes else 0} animes")
+            except Exception as e:
+                batch_errors += 1
+                logger.error(f"Erro no fetch da página {page}: {e}")
+            time.sleep(dynamic_delay)
+    
+    if batch_errors > 0:
+        logger.warning(f"{batch_errors} erros no batch de páginas {min(pages)}-{max(pages)}")
+    
+    return all_animes, all_pagination, dynamic_delay
+
+def log_cycle_report(total_animes_processados):
+    """Loga o relatório do ciclo completo"""
+    global start_time, total_errors, total_traduzidos
+    end_time = datetime.now()
+    execution_time = end_time - start_time
+    success_rate = (total_animes_processados / (total_animes_processados + total_errors)) * 100 if (total_animes_processados + total_errors) > 0 else 0
+    
+    logger.info(f"\n=== Relatório do Ciclo Completo ===")
+    logger.info(f"Tempo total de execução: {execution_time}")
+    logger.info(f"Total de animes processados: {total_animes_processados}")
+    logger.info(f"Total de erros: {total_errors}")
+    logger.info(f"Taxa de sucesso: {success_rate:.2f}%")
+    logger.info(f"Total de animes traduzidos: {total_traduzidos}")
+    logger.info(f"Tempo de fim: {end_time}")
+    logger.info("Reiniciando ciclo da página 1...\n")
+
+def main():
+    global start_time, total_errors, total_traduzidos
+    cycle_count = 0
+    
+    while True:  # Loop infinito
+        cycle_count += 1
+        logger.info(f"=== Iniciando Ciclo {cycle_count} ===")
+        start_time = datetime.now()
+        pagina_atual = load_progress()
+        total_animes_processados = 0
+        dynamic_delay = REQUEST_DELAY
+        total_errors = 0  # Reset por ciclo
+        total_traduzidos = 0  # Reset por ciclo
+        
+        logger.info(f"Ciclo {cycle_count} iniciado a partir da página {pagina_atual}")
+        logger.info(f"Tempo de início: {start_time}")
+        
+        try:
+            # Barra de progresso para batches neste ciclo (estimativa: 1000 páginas totais, ajuste se necessário)
+            with tqdm(desc=f"Ciclo {cycle_count} - Batches processados", unit="batch") as pbar:
+                while True:
+                    logger.info(f"\n--- Processando Batch a partir da Página {pagina_atual} ---")
+                    
+                    batch_pages = list(range(pagina_atual, pagina_atual + MAX_WORKERS))
+                    animes_batch_all, pagination, dynamic_delay = fetch_pages_parallel(batch_pages)
+                    if not animes_batch_all:
+                        logger.info("Nenhum anime encontrado. Fim da lista.")
+                        break
+                        
+                    total_animes = len(animes_batch_all)
+                    logger.info(f"Processando {total_animes} animes do batch...")
+                    
+                    params_batch, mal_ids = process_anime_batch(animes_batch_all)
+                    salvos = insert_anime_batch(params_batch)
+                    total_animes_processados += salvos
+                    
+                    # Após inserir, checar e traduzir synopses pendentes
+                    if salvos > 0:
+                        update_synopsis_batch(mal_ids[:salvos], animes_batch_all)  # Só para os salvos
+                    
+                    save_progress(max(batch_pages))
+                    pagina_atual = max(batch_pages) + 1
+                    
+                    logger.info(f"Batch concluído (páginas {min(batch_pages)}-{max(batch_pages)}): {salvos}/{total_animes} animes processados")
+                    
+                    if not pagination or not pagination.get('has_next_page', True):
+                        logger.info("\nÚltima página atingida.")
+                        break
+                    
+                    time.sleep(dynamic_delay * MAX_WORKERS)
+                    
+                    pbar.update(1)  # Atualiza barra de progresso
+                
+                # Log relatório do ciclo após completar todas as páginas
+                log_cycle_report(total_animes_processados)
+                
+                # Reset para próximo ciclo
+                save_progress(1)
+                pagina_atual = 1
+                
+        except KeyboardInterrupt:
+            logger.info("\nProcesso interrompido pelo usuário.")
+            break
+        except Exception as e:
+            logger.error(f"\nErro inesperado no ciclo {cycle_count}: {e}")
+            # Continua no próximo ciclo mesmo com erro
+        finally:
+            # Não fecha DB aqui, pois loop continua; fecha só em interrupção global
+            pass
+    
+    # Fecha DB apenas ao sair do loop
+    logger.info(f"\nProcesso finalizado após {cycle_count} ciclos! Total de animes processados no último ciclo: {total_animes_processados}")
+    cursor.close()
+    conn.close()
+
+if __name__ == "__main__":
+    main()
