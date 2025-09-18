@@ -30,29 +30,25 @@ logger = logging.getLogger(__name__)
 def load_config():
     parser = argparse.ArgumentParser(description='Anime Scraper Configuration')
     parser.add_argument('--max-workers', type=int, default=3, help='Número máximo de workers para requisições paralelas')
-    parser.add_argument('--request-delay', type=float, default=0.35, help='Delay entre requisições em segundos')
+    parser.add_argument('--request-delay', type=float, default=0.35, help='Delay inicial entre requisições em segundos')
     parser.add_argument('--config-file', type=str, default='config.json', help='Arquivo de configuração')
     args = parser.parse_args()
 
-    # Carregar variáveis de ambiente necessárias
+    # Carregar variável de ambiente necessária
     database_url = os.getenv('DATABASE_URL')
-    mal_client_id = os.getenv('MAL_CLIENT_ID')
     
     if not database_url:
         raise ValueError("DATABASE_URL não encontrado no arquivo .env. Certifique-se de que o arquivo .env existe e contém DATABASE_URL.")
-    
-    if not mal_client_id:
-        logger.warning("MAL_CLIENT_ID não encontrado no arquivo .env. As requisições serão feitas sem autenticação, o que pode resultar em limites de taxa mais baixos.")
 
     config = {
         'MAX_WORKERS': args.max_workers,
         'REQUEST_DELAY': args.request_delay,
         'DATABASE_URL': database_url,
-        'MAL_CLIENT_ID': mal_client_id,  # Adiciona o MAL_CLIENT_ID às configurações
         'LANGUAGE': "pt",
         'MAX_RETRIES': 3,
         'PROGRESS_FILE': "progress.json",
-        'TIMEOUT': 15
+        'TIMEOUT': 15,
+        'MAX_BACKOFF': 60  # Máximo tempo de espera para backoff exponencial
     }
 
     if os.path.exists(args.config_file):
@@ -77,6 +73,7 @@ REQUEST_DELAY = CONFIG['REQUEST_DELAY']
 PROGRESS_FILE = CONFIG['PROGRESS_FILE']
 MAX_WORKERS = CONFIG['MAX_WORKERS']
 TIMEOUT = CONFIG['TIMEOUT']
+MAX_BACKOFF = CONFIG['MAX_BACKOFF']
 
 translator = GoogleTranslator(source='auto', target=LANGUAGE)
 
@@ -306,10 +303,7 @@ def fetch_anime_page(page, retries=MAX_RETRIES, timeout=TIMEOUT):
     url = f"https://api.jikan.moe/v4/anime?page={page}"
     dynamic_delay = REQUEST_DELAY
     
-    # Configura os headers com User-Agent e, se disponível, o MAL_CLIENT_ID
     headers = {'User-Agent': 'Mozilla/5.0'}
-    if 'MAL_CLIENT_ID' in globals() and MAL_CLIENT_ID:
-        headers['X-MAL-CLIENT-ID'] = MAL_CLIENT_ID
     
     for attempt in range(retries):
         try:
@@ -326,22 +320,29 @@ def fetch_anime_page(page, retries=MAX_RETRIES, timeout=TIMEOUT):
                 
                 # Ajusta o delay dinamicamente com base no rate limit
                 if remaining < 5:
-                    dynamic_delay = min(dynamic_delay * 2, 10)  # Aumenta o delay, máximo 10s
+                    dynamic_delay = min(dynamic_delay * 2, MAX_BACKOFF)
                     logger.warning(f"Rate limit baixo ({remaining}). Aumentando delay para {dynamic_delay}s")
                 elif remaining > 30:
-                    dynamic_delay = max(dynamic_delay * 0.75, 0.1)  # Reduz o delay, mínimo 0.1s
+                    dynamic_delay = max(dynamic_delay * 0.75, 0.1)
                     logger.info(f"Rate limit alto ({remaining}). Reduzindo delay para {dynamic_delay}s")
             
             # Processa a resposta
             data = response.json()
             return data.get('data', []), data.get('pagination', {}), dynamic_delay
             
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:  # Too Many Requests
+                backoff = min(2 ** attempt * REQUEST_DELAY, MAX_BACKOFF)
+                logger.warning(f"Erro 429 (Too Many Requests) na página {page}. Aguardando {backoff}s antes de tentar novamente...")
+                time.sleep(backoff)
+            else:
+                logger.error(f"Erro HTTP na requisição (tentativa {attempt+1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    time.sleep(5 * (attempt + 1))
         except requests.exceptions.RequestException as e:
             logger.error(f"Erro na requisição (tentativa {attempt+1}/{retries}): {e}")
-            if attempt < retries - 1:  # Não dormir após a última tentativa
-                sleep_time = 5 * (attempt + 1)
-                logger.info(f"Aguardando {sleep_time} segundos antes de tentar novamente...")
-                time.sleep(sleep_time)
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
     return None, None, dynamic_delay
 
 def validate_anime_data(anime):
@@ -451,184 +452,4 @@ def process_anime(anime):
         
         params = (
             mal_id, title, title_english, title_japanese, title_synonyms,
-            type_, source, episodes, status, status_pt, airing,
-            aired_from, aired_to, duration, rating,
-            score, scored_by, rank, popularity, members, favorites,
-            synopsis, synopsis_pt, background,
-            premiered, broadcast,
-            url, images, trailer,
-            producers, licensors, studios, genres, explicit_genres, themes, demographics,
-            relations,
-            approved, season, season_pt, year,
-            image_url
-        )
-        return params
-    except Exception as e:
-        logger.error(f"Erro ao processar anime {anime.get('mal_id', 'unknown')}: {e}")
-        return None
-
-def process_anime_batch(animes_batch):
-    """Processa um lote de animes e retorna os parâmetros para inserção em lote"""
-    params_batch = []
-    for anime in animes_batch:
-        params = process_anime(anime)
-        if params:
-            params_batch.append(params)
-    return params_batch
-
-def insert_anime_batch(params_batch):
-    """Insere um lote de animes no banco de dados"""
-    if not params_batch:
-        return 0
-        
-    query = """
-    INSERT INTO animes (
-        mal_id, title, title_english, title_japanese, title_synonyms,
-        type, source, episodes, status, status_pt, airing,
-        aired_from, aired_to, duration, rating,
-        score, scored_by, rank, popularity, members, favorites,
-        synopsis, synopsis_pt, background,
-        premiered, broadcast,
-        url, images, trailer,
-        producers, licensors, studios, genres, explicit_genres, themes, demographics,
-        relations,
-        approved, season, season_pt, year,
-        image_url
-    ) VALUES (
-        %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s,
-        %s, %s, %s,
-        %s, %s,
-        %s, %s, %s,
-        %s, %s, %s, %s, %s, %s, %s,
-        %s,
-        %s, %s, %s, %s,
-        %s
-    )
-    ON CONFLICT (mal_id) DO UPDATE SET
-        title = EXCLUDED.title,
-        title_english = EXCLUDED.title_english,
-        title_japanese = EXCLUDED.title_japanese,
-        title_synonyms = EXCLUDED.title_synonyms,
-        type = EXCLUDED.type,
-        source = EXCLUDED.source,
-        episodes = EXCLUDED.episodes,
-        status = EXCLUDED.status,
-        status_pt = EXCLUDED.status_pt,
-        airing = EXCLUDED.airing,
-        aired_from = EXCLUDED.aired_from,
-        aired_to = EXCLUDED.aired_to,
-        duration = EXCLUDED.duration,
-        rating = EXCLUDED.rating,
-        score = EXCLUDED.score,
-        scored_by = EXCLUDED.scored_by,
-        rank = EXCLUDED.rank,
-        popularity = EXCLUDED.popularity,
-        members = EXCLUDED.members,
-        favorites = EXCLUDED.favorites,
-        synopsis = EXCLUDED.synopsis,
-        synopsis_pt = EXCLUDED.synopsis_pt,
-        background = EXCLUDED.background,
-        premiered = EXCLUDED.premiered,
-        broadcast = EXCLUDED.broadcast,
-        url = EXCLUDED.url,
-        images = EXCLUDED.images,
-        trailer = EXCLUDED.trailer,
-        producers = EXCLUDED.producers,
-        licensors = EXCLUDED.licensors,
-        studios = EXCLUDED.studios,
-        genres = EXCLUDED.genres,
-        explicit_genres = EXCLUDED.explicit_genres,
-        themes = EXCLUDED.themes,
-        demographics = EXCLUDED.demographics,
-        relations = EXCLUDED.relations,
-        approved = EXCLUDED.approved,
-        season = EXCLUDED.season,
-        season_pt = EXCLUDED.season_pt,
-        year = EXCLUDED.year,
-        image_url = EXCLUDED.image_url,
-        updated_at = NOW()
-    """
-    
-    try:
-        cursor.executemany(query, params_batch)
-        conn.commit()
-        logger.info(f"Inseridos {len(params_batch)} animes com sucesso.")
-        return len(params_batch)
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Erro ao inserir lote de {len(params_batch)} animes: {e}")
-        return 0
-
-def fetch_pages_parallel(pages):
-    """Fetch múltiplas páginas em paralelo com limite de workers"""
-    all_animes = []
-    all_pagination = None
-    dynamic_delay = REQUEST_DELAY
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_page = {executor.submit(fetch_anime_page, page): page for page in pages}
-        for future in as_completed(future_to_page):
-            page = future_to_page[future]
-            try:
-                animes, pagination, new_delay = future.result()
-                dynamic_delay = new_delay
-                if animes:
-                    all_animes.extend(animes)
-                    if not all_pagination:
-                        all_pagination = pagination
-                logger.info(f"Página {page} fetchada: {len(animes) if animes else 0} animes")
-            except Exception as e:
-                logger.error(f"Erro no fetch da página {page}: {e}")
-            time.sleep(dynamic_delay)
-    return all_animes, all_pagination, dynamic_delay
-
-def main():
-    pagina_atual = load_progress()
-    total_animes_processados = 0
-    dynamic_delay = REQUEST_DELAY
-    
-    logger.info(f"Iniciando a partir da página {pagina_atual}")
-    
-    try:
-        while True:
-            logger.info(f"\n=== Processando a partir da Página {pagina_atual} ===")
-            
-            batch_pages = list(range(pagina_atual, pagina_atual + MAX_WORKERS))
-            animes_batch_all, pagination, dynamic_delay = fetch_pages_parallel(batch_pages)
-            if not animes_batch_all:
-                logger.info("Nenhum anime encontrado. Fim da lista.")
-                break
-                
-            total_animes = len(animes_batch_all)
-            logger.info(f"Processando {total_animes} animes do batch...")
-            
-            params_batch = process_anime_batch(animes_batch_all)
-            salvos = insert_anime_batch(params_batch)
-            total_animes_processados += salvos
-            
-            save_progress(max(batch_pages))
-            pagina_atual = max(batch_pages) + 1
-            
-            logger.info(f"Batch concluído (páginas {min(batch_pages)}-{max(batch_pages)}): {salvos}/{total_animes} animes processados")
-            
-            if not pagination or not pagination.get('has_next_page', True):
-                logger.info("\nÚltima página atingida.")
-                break
-                
-            time.sleep(dynamic_delay * MAX_WORKERS)
-            
-    except KeyboardInterrupt:
-        logger.info("\nProcesso interrompido pelo usuário.")
-    except Exception as e:
-        logger.error(f"\nErro inesperado: {e}")
-    finally:
-        logger.info(f"\nTotal de animes processados: {total_animes_processados}")
-        cursor.close()
-        conn.close()
-    
-    logger.info(f"\nProcesso finalizado! Total de animes processados: {total_animes_processados}")
-
-if __name__ == "__main__":
-    main()
+            type_, source, episodes
