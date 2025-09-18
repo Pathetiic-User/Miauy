@@ -40,15 +40,15 @@ def load_config():
     args = parser.parse_args()
 
     # Carregar variáveis de ambiente necessárias
-    database_url = os.getenv('DATABASE_URL_IPV4')
+    database_url = os.getenv('DATABASE_URL')
     
     if not database_url:
-        raise ValueError("DATABASE_URL_IPV4 não encontrado no arquivo .env. Certifique-se de que o arquivo .env existe e contém DATABASE_URL_IPV4.")
+        raise ValueError("DATABASE_URL não encontrado no arquivo .env. Certifique-se de que o arquivo .env existe e contém DATABASE_URL.")
 
     config = {
         'MAX_WORKERS': args.max_workers,
         'REQUEST_DELAY': args.request_delay,
-        'DATABASE_URL_IPV4': database_url,
+        'DATABASE_URL': database_url,
         'LANGUAGE': "pt",
         'MAX_RETRIES': 3,
         'PROGRESS_FILE': "progress.json",
@@ -71,7 +71,7 @@ def load_config():
     return config
 
 CONFIG = load_config()
-DATABASE_URL = CONFIG['DATABASE_URL_IPV4']
+DATABASE_URL = CONFIG['DATABASE_URL']
 LANGUAGE = CONFIG['LANGUAGE']
 MAX_RETRIES = CONFIG['MAX_RETRIES']
 REQUEST_DELAY = CONFIG['REQUEST_DELAY']
@@ -175,7 +175,7 @@ ANIME_SCHEMA = {
 def init_database():
     """Inicializa o banco de dados e cria a tabela se não existir"""
     try:
-        conn = psycopg2.connect(DATABASE_URL_IPV4)
+        conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         
         # Verificar se a tabela já existe
