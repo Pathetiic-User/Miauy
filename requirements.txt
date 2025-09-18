@@ -1,3 +1,4 @@
+# Bibliotecas principais
 discord.py>=2.3.2
 python-dotenv>=1.0.0
 requests>=2.31.0
@@ -5,6 +6,8 @@ psycopg2-binary>=2.9.9
 deep-translator>=1.11.4
 tqdm>=4.66.1
 jsonschema>=4.20.0
+
+# Dependências assíncronas
 aiohttp>=3.9.0
 aiohappyeyeballs>=2.5.0
 aiosignal>=1.4.0
