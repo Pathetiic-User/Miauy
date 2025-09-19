@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 import requests
