@@ -461,7 +461,7 @@ def process_anime_batch(conn, mal_ids, error_ids):
     updated_count = 0
     for mid in mal_ids:
         result = update_anime(mid, conn, error_ids)
-        if result is True:  # Apenas conta como atualizado se houver mudanças
+        if result:  # Se result não for None, significa que foi atualizado com sucesso
             updated_count += 1
     return updated_count
 

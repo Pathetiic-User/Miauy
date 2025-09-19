@@ -1,2 +1,2 @@
 Miauy: python Miauy.py
-Atualizar Animes Existentes: python anime_updater.py
+Atualizar Animes Existentes: MAL_anime_updater.py
