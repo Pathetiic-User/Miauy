@@ -113,6 +113,7 @@ def wait_for_rate_limit():
     time.sleep(DELAY_BETWEEN_REQUESTS)
 
 def update_anime(mal_id, conn, error_ids):
+    is_new = False
     try:
         with semaphore:
             # Wait to respect rate limits
@@ -200,7 +201,12 @@ def update_anime(mal_id, conn, error_ids):
             image_url = data['images']['jpg'].get('image_url') if data.get('images', {}).get('jpg') else None
             external_links = json.dumps(data.get('external', []))
 
-            # Execute UPDATE query
+            # Verifica se o anime já existe
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM public.animes WHERE mal_id = %s", (mal_id,))
+                is_new = cur.rowcount == 0
+                
+            # Execute UPDATE ou INSERT query
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE public.animes SET
@@ -255,8 +261,11 @@ def update_anime(mal_id, conn, error_ids):
                     relations, approved, season, year, image_url, external_links, mal_id
                 ))
             conn.commit()
-            logger.info(f"Successfully updated anime with mal_id: {mal_id}")
-            return True  # Indica sucesso APÓS atualização no banco
+            if is_new:
+                logger.info(f"✅ NOVO ANIME ADICIONADO - mal_id: {mal_id} - Título: {title}")
+            else:
+                logger.info(f"✅ Anime atualizado - mal_id: {mal_id} - Título: {title}")
+            return {'is_new': is_new, 'title': title}
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 429:  # Too Many Requests
             retry_after = int(e.response.headers.get('Retry-After', 60))
@@ -308,8 +317,17 @@ def send_startup_notification():
     except Exception as e:
         logger.error("Erro ao enviar notificação de inicialização para o Discord", exc_info=True)
 
-def send_discord_notification(updated_count, error_ids):
-    """Envia notificação de atualização para o webhook do Discord"""
+def send_discord_notification(updated_count, error_ids, new_animes=None):
+    """
+    Envia notificação de atualização para o webhook do Discord
+    
+    Args:
+        updated_count: Número de animes atualizados
+        error_ids: Lista de IDs com erro
+        new_animes: Lista de dicionários com informações dos novos animes adicionados
+    """
+    if new_animes is None:
+        new_animes = []
     webhook_id = os.getenv('DISCORD_WEBHOOK_ID')
     webhook_token = os.getenv('DISCORD_WEBHOOK_TOKEN')
     
@@ -321,6 +339,18 @@ def send_discord_notification(updated_count, error_ids):
     
     # Formata a lista de IDs com erro
     error_ids_str = ", ".join(map(str, error_ids)) if error_ids else "Nenhum"
+    
+    # Adiciona informações sobre novos animes
+    new_animes_fields = []
+    if new_animes:
+        for anime in new_animes[:5]:  # Limita a 5 novos animes na notificação
+            title = anime.get('title', 'Sem título')
+            mal_id = anime.get('mal_id', 'N/A')
+            new_animes_fields.append({
+                "name": f"🎬 {title}",
+                "value": f"ID: {mal_id}",
+                "inline": False
+            })
     
     # Determina a cor do embed (vermelho se houver erros, verde se não)
     color = 15158332 if error_ids else 2192415
@@ -334,6 +364,24 @@ def send_discord_notification(updated_count, error_ids):
                 f"Anime(s) com Erro: **{len(error_ids)}**\n\n"
                 f"IDs com erro: {error_ids_str if error_ids else 'Nenhum'}"
             ),
+            "fields": [
+                {
+                    "name": "Atualizações",
+                    "value": f"✅ {updated_count} animes atualizados"
+                },
+                {
+                    "name": "Novos Animes",
+                    "value": f"🎉 {len(new_animes)} novos animes adicionados" if new_animes else "✨ Nenhum anime novo"
+                },
+                {
+                    "name": "Erros",
+                    "value": f"❌ {len(error_ids)} erros"
+                },
+                {
+                    "name": "IDs com erro",
+                    "value": error_ids_str[:1000]  # Limita o tamanho para evitar erros do Discord
+                }
+            ] + new_animes_fields,  # Adiciona os campos dos novos animes
             "footer": {
                 "text": "Relatório Completo Em"
             },
@@ -415,9 +463,10 @@ def main():
     # Envia notificação de inicialização
     send_startup_notification()
     
-    # Lista para armazenar IDs com erro
+    # Lista para armazenar IDs com erro e novos animes
     error_ids = []
     updated_count = 0
+    new_animes = []
 
     try:
         while True:
@@ -450,20 +499,30 @@ def main():
                         
                         # Use ThreadPoolExecutor with a single worker to avoid overwhelming the API
                         with ThreadPoolExecutor(max_workers=1) as executor:
-                            results = list(executor.map(lambda mid: update_anime(mid, conn, error_ids), batch))
-                            updated_count += len([r for r in results if r is True])
+                            # Atualiza os animes e captura os resultados
+                            results = []
+                            for mid in batch:
+                                result = update_anime(mid, conn, error_ids)
+                                if isinstance(result, dict) and 'is_new' in result:
+                                    if result['is_new']:
+                                        new_animes.append({
+                                            'mal_id': mid,
+                                            'title': result.get('title', 'Sem título')
+                                        })
+                                    updated_count += 1
+                                elif result is True:
+                                    updated_count += 1
+                                results.append(result)
 
                 logger.info(f"Update cycle completed. Updated {updated_count} animes. "
                             f"Errors: {len(error_ids)}")
-                if error_ids:
-                    logger.warning(f"IDs com erro: {error_ids}")
-                
                 # Envia notificação para o Discord
-                send_discord_notification(updated_count, error_ids)
+                send_discord_notification(updated_count, error_ids, new_animes)
                 
                 # Reseta os contadores para o próximo ciclo
                 updated_count = 0
                 error_ids = []
+                new_animes = []
                 
             finally:
                 # Libera a conexão de volta para o pool
