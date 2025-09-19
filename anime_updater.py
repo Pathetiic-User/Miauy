@@ -283,7 +283,7 @@ def update_anime(mal_id, conn, error_ids):
         error_ids.append(mal_id)
     finally:
         # Small additional delay to be extra safe with rate limits
-        time.sleep(0.1)
+        time.sleep(1.5)
 
 def send_startup_notification():
     """Envia notificação de inicialização para o webhook do Discord"""
@@ -370,10 +370,6 @@ def send_discord_notification(updated_count, error_ids, new_animes=None):
                     "value": f"✅ {updated_count} Animes atualizados"
                 },
                 {
-                    "name": "Novos Animes",
-                    "value": f"🎉 {len(new_animes)} Novos Animes Adicionados" if new_animes else "✨ Nenhum anime novo"
-                },
-                {
                     "name": "Erros",
                     "value": f"❌ {len(error_ids)} Erros"
                 },
@@ -451,6 +447,24 @@ def close_all_connections():
         conn_pool.closeall()
         logger.info("Todas as conexões foram fechadas")
 
+def get_non_finished_anime_ids(conn):
+    """Busca os IDs dos animes que não estão com status 'Finished Airing'"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT mal_id FROM public.animes 
+            WHERE status != 'Finished Airing' AND status IS NOT NULL
+        """)
+        return [row[0] for row in cur.fetchall()]
+
+def process_anime_batch(conn, mal_ids, error_ids):
+    """Processa um lote de animes e retorna a contagem de atualizações"""
+    updated_count = 0
+    for mid in mal_ids:
+        result = update_anime(mid, conn, error_ids)
+        if result is True:  # Apenas conta como atualizado se houver mudanças
+            updated_count += 1
+    return updated_count
+
 def main():
     global conn_pool
     
@@ -463,10 +477,9 @@ def main():
     # Envia notificação de inicialização
     send_startup_notification()
     
-    # Lista para armazenar IDs com erro e novos animes
+    # Lista para armazenar IDs com erro
     error_ids = []
     updated_count = 0
-    new_animes = []
 
     try:
         while True:
@@ -474,55 +487,41 @@ def main():
             conn = None
             try:
                 conn = get_db_connection()
-                # Fetch all mal_ids from the table
-                with conn.cursor() as cur:
-                    cur.execute("SELECT mal_id FROM public.animes")
-                    mal_ids = [row[0] for row in cur.fetchall()]
-
-                if not mal_ids:
-                    logger.info("No animes found in the database. Sleeping for 30 minutes.")
+                
+                # Busca apenas os animes não finalizados
+                non_finished_ids = get_non_finished_anime_ids(conn)
+                
+                if not non_finished_ids:
+                    logger.info("Nenhum anime não finalizado encontrado. Aguardando 30 minutos...")
                 else:
-                    logger.info(f"Starting update for {len(mal_ids)} animes...")
-                    # Use ThreadPoolExecutor for parallel updates (I/O-bound, so threading is fine)
-                    # Process in smaller batches to better control rate limiting
-                    batch_size = 75  # Process 75 at a time
-                    total_animes = len(mal_ids)
-                    total_batches = (total_animes + batch_size - 1) // batch_size  # Arredonda para cima
+                    logger.info(f"Encontrados {len(non_finished_ids)} animes não finalizados. Atualizando...")
                     
-                    for batch_num, i in enumerate(range(0, total_animes, batch_size), 1):
-                        batch = mal_ids[i:i + batch_size]
-                        processed = min(i + batch_size, total_animes)
-                        progress = (i / total_animes) * 100
+                    # Processa os animes não finalizados em lotes
+                    batch_size = 50  # Reduzido para evitar sobrecarga
+                    total_batches = (len(non_finished_ids) + batch_size - 1) // batch_size
+                    
+                    for batch_num, i in enumerate(range(0, len(non_finished_ids), batch_size), 1):
+                        batch = non_finished_ids[i:i + batch_size]
+                        processed = min(i + batch_size, len(non_finished_ids))
+                        progress = (i / len(non_finished_ids)) * 100
                         
                         logger.info(f"Processando lote {batch_num}/{total_batches} - "
-                                    f"Animes: {processed}/{total_animes} ({progress:.1f}%)")
+                                  f"Animes: {processed}/{len(non_finished_ids)} ({progress:.1f}%)")
                         
-                        # Use ThreadPoolExecutor with a single worker to avoid overwhelming the API
                         with ThreadPoolExecutor(max_workers=1) as executor:
-                            # Atualiza os animes e captura os resultados
-                            results = []
-                            for mid in batch:
-                                result = update_anime(mid, conn, error_ids)
-                                if isinstance(result, dict) and 'is_new' in result:
-                                    if result['is_new']:
-                                        new_animes.append({
-                                            'mal_id': mid,
-                                            'title': result.get('title', 'Sem título')
-                                        })
-                                    updated_count += 1
-                                elif result is True:
-                                    updated_count += 1
-                                results.append(result)
-
-                logger.info(f"Update cycle completed. Updated {updated_count} animes. "
-                            f"Errors: {len(error_ids)}")
+                            updated_count += process_anime_batch(conn, batch, error_ids)
+                    
+                    logger.info(f"Atualização concluída. Animes atualizados: {updated_count}")
+                
+                logger.info(f"Ciclo de atualização concluído. Animes atualizados: {updated_count}. "
+                          f"Erros: {len(error_ids)}")
+                
                 # Envia notificação para o Discord
-                send_discord_notification(updated_count, error_ids, new_animes)
+                send_discord_notification(updated_count, error_ids, [])
                 
                 # Reseta os contadores para o próximo ciclo
                 updated_count = 0
                 error_ids = []
-                new_animes = []
                 
             finally:
                 # Libera a conexão de volta para o pool
