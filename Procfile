@@ -1,2 +1,2 @@
-bot: python Miauy.py
-worker: python anime_updater.py
+Miauy: python Miauy.py
+Atualizar Animes Existentes: python anime_updater.py
