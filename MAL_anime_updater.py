@@ -465,8 +465,66 @@ def process_anime_batch(conn, mal_ids, error_ids):
             updated_count += 1
     return updated_count
 
-def main():
+def main_task():
+    """Executa uma única iteração da tarefa principal de atualização."""
     global conn_pool
+    error_ids = []
+    updated_count = 0
+    
+    try:
+        # Obtém uma conexão do pool
+        conn = get_db_connection()
+        
+        try:
+            # Busca apenas os animes não finalizados
+            non_finished_ids = get_non_finished_anime_ids(conn)
+            
+            if not non_finished_ids:
+                logger.info("Nenhum anime não finalizado encontrado.")
+                return 0, []
+                
+            logger.info(f"Encontrados {len(non_finished_ids)} animes não finalizados. Atualizando...")
+            
+            # Processa os animes não finalizados em lotes
+            batch_size = 50
+            total_batches = (len(non_finished_ids) + batch_size - 1) // batch_size
+            
+            for batch_num, i in enumerate(range(0, len(non_finished_ids), batch_size), 1):
+                batch = non_finished_ids[i:i + batch_size]
+                processed = min(i + batch_size, len(non_finished_ids))
+                progress = (i / len(non_finished_ids)) * 100
+                
+                logger.info(f"Processando lote {batch_num}/{total_batches} - "
+                          f"Animes: {processed}/{len(non_finished_ids)} ({progress:.1f}%)")
+                
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    updated_count += process_anime_batch(conn, batch, error_ids)
+            
+            logger.info(f"Atualização concluída. Animes atualizados: {updated_count}")
+            return updated_count, error_ids
+            
+        finally:
+            # Libera a conexão de volta para o pool
+            if conn:
+                release_db_connection(conn)
+                
+    except Exception as e:
+        logger.error(f"Erro durante a execução da tarefa: {e}", exc_info=True)
+        return updated_count, [f"Erro na execução: {str(e)}"]
+
+def main():
+    """Função principal que gerencia o loop de execução do script."""
+    global conn_pool
+    
+    # Carrega as variáveis de ambiente
+    load_dotenv()
+    
+    # Configuração do intervalo entre execuções (em segundos)
+    INTERVALO_ENTRE_EXECUCOES = int(os.getenv('INTERVALO_ENTRE_EXECUCOES', '1800'))  # Padrão: 30 minutos
+    INTERVALO_EM_ERRO = int(os.getenv('INTERVALO_EM_ERRO', '300'))  # 5 minutos em caso de erro
+    
+    logger.info("=== Iniciando MAL Anime Updater ===")
+    logger.info(f"Intervalo entre execuções: {INTERVALO_ENTRE_EXECUCOES} segundos")
     
     # Inicializa o pool de conexões
     conn_pool = init_connection_pool()
@@ -477,67 +535,55 @@ def main():
     # Envia notificação de inicialização
     send_startup_notification()
     
-    # Lista para armazenar IDs com erro
-    error_ids = []
-    updated_count = 0
-
+    # Contador de ciclos
+    ciclo = 0
+    
     try:
         while True:
-            # Obtém uma conexão do pool
-            conn = None
+            ciclo += 1
+            tempo_inicio = time.time()
+            
+            logger.info(f"\n=== CICLO {ciclo} ===")
+            logger.info(f"Iniciando em: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            
             try:
-                conn = get_db_connection()
-                
-                # Busca apenas os animes não finalizados
-                non_finished_ids = get_non_finished_anime_ids(conn)
-                
-                if not non_finished_ids:
-                    logger.info("Nenhum anime não finalizado encontrado. Aguardando 30 minutos...")
-                else:
-                    logger.info(f"Encontrados {len(non_finished_ids)} animes não finalizados. Atualizando...")
-                    
-                    # Processa os animes não finalizados em lotes
-                    batch_size = 50  # Reduzido para evitar sobrecarga
-                    total_batches = (len(non_finished_ids) + batch_size - 1) // batch_size
-                    
-                    for batch_num, i in enumerate(range(0, len(non_finished_ids), batch_size), 1):
-                        batch = non_finished_ids[i:i + batch_size]
-                        processed = min(i + batch_size, len(non_finished_ids))
-                        progress = (i / len(non_finished_ids)) * 100
-                        
-                        logger.info(f"Processando lote {batch_num}/{total_batches} - "
-                                  f"Animes: {processed}/{len(non_finished_ids)} ({progress:.1f}%)")
-                        
-                        with ThreadPoolExecutor(max_workers=1) as executor:
-                            updated_count += process_anime_batch(conn, batch, error_ids)
-                    
-                    logger.info(f"Atualização concluída. Animes atualizados: {updated_count}")
-                
-                logger.info(f"Ciclo de atualização concluído. Animes atualizados: {updated_count}. "
-                          f"Erros: {len(error_ids)}")
+                # Executa a tarefa principal
+                updated_count, error_ids = main_task()
                 
                 # Envia notificação para o Discord
-                send_discord_notification(updated_count, error_ids, [])
+                if updated_count > 0 or error_ids:
+                    send_discord_notification(updated_count, error_ids, [])
                 
-                # Reseta os contadores para o próximo ciclo
-                updated_count = 0
-                error_ids = []
-                new_animes = []
+                # Calcula o tempo de execução
+                tempo_execucao = time.time() - tempo_inicio
+                logger.info(f"Ciclo {ciclo} concluído em {tempo_execucao:.2f} segundos")
                 
-            finally:
-                # Libera a conexão de volta para o pool
-                if conn:
-                    release_db_connection(conn)
+                # Calcula o tempo de espera até a próxima execução
+                tempo_restante = max(0, INTERVALO_ENTRE_EXECUCOES - tempo_execucao)
+                intervalo = INTERVALO_ENTRE_EXECUCOES
+                
+            except Exception as e:
+                logger.error(f"Erro inesperado no ciclo {ciclo}: {e}", exc_info=True)
+                tempo_restante = INTERVALO_EM_ERRO
+                intervalo = INTERVALO_EM_ERRO
+                
+                try:
+                    send_discord_notification(0, [f"Erro inesperado: {str(e)}"], [])
+                except Exception as discord_err:
+                    logger.error(f"Falha ao enviar notificação de erro: {discord_err}")
             
-            time.sleep(30 * 60)  # 30 minutes in seconds
+            # Aguarda até a próxima execução
+            if tempo_restante > 0:
+                logger.info(f"Aguardando {tempo_restante:.0f} segundos até a próxima execução...")
+                time.sleep(tempo_restante)
+            
     except KeyboardInterrupt:
-        logger.info("Script interrompido pelo usuário. Enviando notificação final...")
-        send_discord_notification(updated_count, error_ids)
-        logger.info("Saindo...")
+        logger.info("\nScript interrompido pelo usuário.")
     except Exception as e:
-        logger.error(f"Erro no loop principal: {e}", exc_info=True)
-        send_discord_notification(updated_count, error_ids)
-        raise
+        logger.critical(f"ERRO CRÍTICO: {e}", exc_info=True)
+    finally:
+        logger.info("Encerrando o MAL Anime Updater...")
+        close_all_connections()
 
 # Variável global para o pool de conexões
 conn_pool = None
@@ -545,8 +591,16 @@ conn_pool = None
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        logger.info("Script interrompido pelo usuário.")
     except Exception as e:
         logger.critical(f"Erro fatal: {e}", exc_info=True)
+        try:
+            send_discord_notification(0, [f"ERRO FATAL: {str(e)}"], [])
+        except Exception as discord_err:
+            logger.error(f"Falha ao enviar notificação de erro fatal: {discord_err}")
+    finally:
+        logger.info("Script finalizado.")
         if 'conn_pool' in globals() and conn_pool:
             close_all_connections()
         raise
