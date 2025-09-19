@@ -522,6 +522,7 @@ def main():
                 # Reseta os contadores para o próximo ciclo
                 updated_count = 0
                 error_ids = []
+                new_animes = []
                 
             finally:
                 # Libera a conexão de volta para o pool

@@ -112,71 +112,46 @@ def wait_for_rate_limit():
     # Respect requests per second limit
     time.sleep(DELAY_BETWEEN_REQUESTS)
 
-def get_seasonal_mal_ids(season_type):
-    """Fetch mal_ids from seasonal anime (now or upcoming) with pagination"""
-    mal_ids = []
-    page = 1
-    while True:
-        try:
-            with semaphore:
-                wait_for_rate_limit()
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        response = requests.get(
-                            f"https://api.jikan.moe/v4/seasons/{season_type}?page={page}&limit=25",
-                            timeout=10
-                        )
-                        response.raise_for_status()
-                        break
-                    except requests.exceptions.RequestException as e:
-                        if attempt == max_retries - 1:
-                            raise
-                        wait_time = (attempt + 1) * 5
-                        logger.warning(f"Request failed for {season_type} page {page}, attempt {attempt + 1}/{max_retries}. Retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-            data = response.json()
-            if not data.get('data'):
-                break
-            for anime in data['data']:
-                mal_ids.append(anime['mal_id'])
-            if not data['pagination'].get('has_next_page'):
-                break
-            page += 1
-            time.sleep(0.1)  # Extra delay
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                retry_after = int(e.response.headers.get('Retry-After', 60))
-                logger.warning(f"Rate limited on seasonal fetch. Waiting {retry_after} seconds...")
-                time.sleep(retry_after)
-                continue
-            logger.error(f"HTTP error for {season_type} page {page}: {e}")
-            break
-        except Exception as e:
-            logger.error(f"Error fetching {season_type} page {page}: {e}")
-            break
-    logger.info(f"Fetched {len(mal_ids)} mal_ids from {season_type}")
-    return mal_ids
-
 def update_anime(mal_id, conn, error_ids):
     is_new = False
-    try:
-        with semaphore:
-            # Wait to respect rate limits
-            wait_for_rate_limit()
-            
-            # Make the request with retry logic
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    response = requests.get(f"https://api.jikan.moe/v4/anime/{mal_id}/full", timeout=10)
-                    response.raise_for_status()
-                except requests.exceptions.RequestException as e:
-                    if attempt == max_retries - 1:  # Last attempt
-                        raise
-                    wait_time = (attempt + 1) * 5  # Exponential backoff
-                    logger.warning(f"Request failed for mal_id {mal_id}, attempt {attempt + 1}/{max_retries}. Retrying in {wait_time} seconds...")
+    retry_delays = [5, 10, 15, 25, 30, 60]  # Tempos de espera em segundos para cada tentativa
+    max_retries = len(retry_delays)
+    
+    for attempt in range(max_retries):
+        try:
+            with semaphore:
+                # Wait to respect rate limits
+                wait_for_rate_limit()
+                
+                # Make the request
+                response = requests.get(f"https://api.jikan.moe/v4/anime/{mal_id}/full", timeout=10)
+                response.raise_for_status()
+                break  # Se chegou aqui, a requisição foi bem-sucedida
+                
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:  # Rate limit
+                if attempt < max_retries - 1:
+                    wait_time = retry_delays[attempt]
+                    logger.warning(f"Rate limit atingido para mal_id {mal_id}. Tentativa {attempt + 1}/{max_retries}. Aguardando {wait_time} segundos...")
                     time.sleep(wait_time)
+                    continue
+                else:
+                    # Na última tentativa, espera 60 segundos e tenta novamente
+                    logger.warning(f"Máximo de tentativas atingido para mal_id {mal_id}. Aguardando 60 segundos...")
+                    time.sleep(60)
+                    continue
+            else:
+                logger.error(f"HTTP error for mal_id {mal_id}: {e}", exc_info=True)
+                raise
+                
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = retry_delays[attempt]
+                logger.warning(f"Erro na requisição para mal_id {mal_id}. Tentativa {attempt + 1}/{max_retries}. Aguardando {wait_time} segundos...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"API request error for mal_id {mal_id}: {e}", exc_info=True)
+                raise
             data = response.json()['data']
 
             # Parse fields from API response
@@ -210,7 +185,7 @@ def update_anime(mal_id, conn, error_ids):
             
             # Temporada em inglês e português
             season = data.get('season')
-            season_pt = SEASON_TRANSLATIONS.get(season.lower() if season else None, season)
+            season_pt = SEASON_TRANSLATIONS.get(season.lower(), season) if season else None
             year = data.get('year')
             
             # Se year for NULL, tenta obter do campo aired_from
@@ -247,87 +222,70 @@ def update_anime(mal_id, conn, error_ids):
             image_url = data['images']['jpg'].get('image_url') if data.get('images', {}).get('jpg') else None
             external_links = json.dumps(data.get('external', []))
 
-            # Prepare parameters tuple (without mal_id and updated_at)
-            params = (
-                title, title_english, title_japanese, title_synonyms, anime_type, source, episodes, status,
-                status_pt, airing, aired_from, aired_to, duration, rating, score, scored_by, rank, popularity,
-                members, favorites, synopsis, background, premiered, season_pt, broadcast, url,
-                images, trailer, producers, licensors, studios, genres, explicit_genres, themes, demographics,
-                relations, approved, season, year, image_url, external_links
-            )
-
             # Verifica se o anime já existe
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 FROM public.animes WHERE mal_id = %s", (mal_id,))
-                exists = cur.fetchone() is not None
-                is_new = not exists
-
+                is_new = cur.rowcount == 0
+                
+            # Execute UPDATE ou INSERT query
             with conn.cursor() as cur:
-                if is_new:
-                    cur.execute("""
-                        INSERT INTO public.animes (
-                            mal_id, title, title_english, title_japanese, title_synonyms, type, source, episodes, status,
-                            status_pt, airing, aired_from, aired_to, duration, rating, score, scored_by, rank, popularity,
-                            members, favorites, synopsis, background, premiered, season_pt, broadcast, url,
-                            images, trailer, producers, licensors, studios, genres, explicit_genres, themes, demographics,
-                            relations, approved, season, year, image_url, external_links, updated_at
-                        ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
-                            %s, %s, %s, %s, %s::jsonb, NOW()
-                        )
-                    """, (mal_id,) + params)
-                    logger.info(f"✅ NOVO ANIME ADICIONADO - mal_id: {mal_id} - Título: {title}")
-                else:
-                    cur.execute("""
-                        UPDATE public.animes SET
-                            title = %s,
-                            title_english = %s,
-                            title_japanese = %s,
-                            title_synonyms = %s,
-                            type = %s,
-                            source = %s,
-                            episodes = %s,
-                            status = %s,
-                            status_pt = %s,
-                            airing = %s,
-                            aired_from = %s,
-                            aired_to = %s,
-                            duration = %s,
-                            rating = %s,
-                            score = %s,
-                            scored_by = %s,
-                            rank = %s,
-                            popularity = %s,
-                            members = %s,
-                            favorites = %s,
-                            synopsis = %s,
-                            background = %s,
-                            premiered = %s,
-                            season_pt = %s,
-                            broadcast = %s,
-                            url = %s,
-                            images = %s::jsonb,
-                            trailer = %s::jsonb,
-                            producers = %s::jsonb,
-                            licensors = %s::jsonb,
-                            studios = %s::jsonb,
-                            genres = %s::jsonb,
-                            explicit_genres = %s::jsonb,
-                            themes = %s::jsonb,
-                            demographics = %s::jsonb,
-                            relations = %s::jsonb,
-                            approved = %s,
-                            season = %s,
-                            year = %s,
-                            image_url = %s,
-                            external_links = %s::jsonb,
-                            updated_at = NOW()
-                        WHERE mal_id = %s
-                    """, params + (mal_id,))
-                    logger.info(f"✅ Anime atualizado - mal_id: {mal_id} - Título: {title}")
+                cur.execute("""
+                    UPDATE public.animes SET
+                        title = %s,
+                        title_english = %s,
+                        title_japanese = %s,
+                        title_synonyms = %s,
+                        type = %s,
+                        source = %s,
+                        episodes = %s,
+                        status = %s,
+                        status_pt = %s,
+                        airing = %s,
+                        aired_from = %s,
+                        aired_to = %s,
+                        duration = %s,
+                        rating = %s,
+                        score = %s,
+                        scored_by = %s,
+                        rank = %s,
+                        popularity = %s,
+                        members = %s,
+                        favorites = %s,
+                        synopsis = %s,
+                        background = %s,
+                        premiered = %s,
+                        season_pt = %s,
+                        broadcast = %s,
+                        url = %s,
+                        images = %s::jsonb,
+                        trailer = %s::jsonb,
+                        producers = %s::jsonb,
+                        licensors = %s::jsonb,
+                        studios = %s::jsonb,
+                        genres = %s::jsonb,
+                        explicit_genres = %s::jsonb,
+                        themes = %s::jsonb,
+                        demographics = %s::jsonb,
+                        relations = %s::jsonb,
+                        approved = %s,
+                        season = %s,
+                        year = %s,
+                        image_url = %s,
+                        updated_at = NOW(),
+                        external_links = %s::jsonb
+                    WHERE mal_id = %s
+                """, (
+                    title, title_english, title_japanese, title_synonyms, anime_type, source, episodes, status,
+                    status_pt, airing, aired_from, aired_to, duration, rating, score, scored_by, rank, popularity,
+                    members, favorites, synopsis, background, premiered, season_pt, broadcast, url,
+                    images, trailer, producers, licensors, studios, genres, explicit_genres, themes, demographics,
+                    relations, approved, season, year, image_url, external_links, mal_id
+                ))
             conn.commit()
+            if is_new:
+                logger.info(f"✅ NOVO ANIME ADICIONADO - mal_id: {mal_id} - Título: {title}")
+            else:
+                logger.info(f"✅ Anime atualizado - mal_id: {mal_id} - Título: {title}")
             return {'is_new': is_new, 'title': title}
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 429:  # Too Many Requests
@@ -346,8 +304,7 @@ def update_anime(mal_id, conn, error_ids):
         error_ids.append(mal_id)
     finally:
         # Small additional delay to be extra safe with rate limits
-        time.sleep(0.1)
-        return None
+        time.sleep(1.5)
 
 def send_startup_notification():
     """Envia notificação de inicialização para o webhook do Discord"""
@@ -381,13 +338,12 @@ def send_startup_notification():
     except Exception as e:
         logger.error("Erro ao enviar notificação de inicialização para o Discord", exc_info=True)
 
-def send_discord_notification(updated_count, added_count, error_ids, new_animes=None):
+def send_discord_notification(updated_count, error_ids, new_animes=None):
     """
     Envia notificação de atualização para o webhook do Discord
     
     Args:
-        updated_count: Número de animes atualizados (não inclui adições)
-        added_count: Número de animes adicionados
+        updated_count: Número de animes atualizados
         error_ids: Lista de IDs com erro
         new_animes: Lista de dicionários com informações dos novos animes adicionados
     """
@@ -425,8 +381,7 @@ def send_discord_notification(updated_count, added_count, error_ids, new_animes=
             "color": color,
             "title": "Script Worker Railway - Realizado com Sucesso!!",
             "description": (
-                f"Anime(s) atualizados: **{updated_count}**\n"
-                f"Anime(s) adicionados: **{added_count}**\n\n"
+                f"Anime(s) atualizados: **{updated_count}**\n\n"
                 f"Anime(s) com Erro: **{len(error_ids)}**\n\n"
                 f"IDs com erro: {error_ids_str if error_ids else 'Nenhum'}"
             ),
@@ -434,10 +389,6 @@ def send_discord_notification(updated_count, added_count, error_ids, new_animes=
                 {
                     "name": "Atualizações",
                     "value": f"✅ {updated_count} Animes atualizados"
-                },
-                {
-                    "name": "Adições",
-                    "value": f"🎉 {added_count} Novos Animes Adicionados" if added_count > 0 else "✨ Nenhum anime novo"
                 },
                 {
                     "name": "Erros",
@@ -517,6 +468,24 @@ def close_all_connections():
         conn_pool.closeall()
         logger.info("Todas as conexões foram fechadas")
 
+def get_non_finished_anime_ids(conn):
+    """Busca os IDs dos animes que não estão com status 'Finished Airing'"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT mal_id FROM public.animes 
+            WHERE status != 'Finished Airing' AND status IS NOT NULL
+        """)
+        return [row[0] for row in cur.fetchall()]
+
+def process_anime_batch(conn, mal_ids, error_ids):
+    """Processa um lote de animes e retorna a contagem de atualizações"""
+    updated_count = 0
+    for mid in mal_ids:
+        result = update_anime(mid, conn, error_ids)
+        if result is True:  # Apenas conta como atualizado se houver mudanças
+            updated_count += 1
+    return updated_count
+
 def main():
     global conn_pool
     
@@ -529,11 +498,9 @@ def main():
     # Envia notificação de inicialização
     send_startup_notification()
     
-    # Lista para armazenar IDs com erro e novos animes
+    # Lista para armazenar IDs com erro
     error_ids = []
     updated_count = 0
-    added_count = 0
-    new_animes = []
 
     try:
         while True:
@@ -541,63 +508,41 @@ def main():
             conn = None
             try:
                 conn = get_db_connection()
-                # Fetch all mal_ids from the table for updates
-                with conn.cursor() as cur:
-                    cur.execute("SELECT mal_id FROM public.animes")
-                    db_ids = [row[0] for row in cur.fetchall()]
-
-                # Fetch mal_ids from current and upcoming seasons for potential adds/updates
-                now_ids = get_seasonal_mal_ids('now')
-                upcoming_ids = get_seasonal_mal_ids('upcoming')
-                season_ids = now_ids + upcoming_ids
-
-                # Combine and unique
-                all_ids = list(set(db_ids + season_ids))
-
-                if not all_ids:
-                    logger.info("No animes to process. Sleeping for 30 minutes.")
+                
+                # Busca apenas os animes não finalizados
+                non_finished_ids = get_non_finished_anime_ids(conn)
+                
+                if not non_finished_ids:
+                    logger.info("Nenhum anime não finalizado encontrado. Aguardando 30 minutos...")
                 else:
-                    logger.info(f"Starting process for {len(all_ids)} animes (including potential new ones)...")
-                    # Process in smaller batches to better control rate limiting
-                    batch_size = 75  # Process 75 at a time
-                    total_animes = len(all_ids)
-                    total_batches = (total_animes + batch_size - 1) // batch_size  # Arredonda para cima
+                    logger.info(f"Encontrados {len(non_finished_ids)} animes não finalizados. Atualizando...")
                     
-                    for batch_num, i in enumerate(range(0, total_animes, batch_size), 1):
-                        batch = all_ids[i:i + batch_size]
-                        processed = min(i + batch_size, total_animes)
-                        progress = (processed / total_animes) * 100
+                    # Processa os animes não finalizados em lotes
+                    batch_size = 50  # Reduzido para evitar sobrecarga
+                    total_batches = (len(non_finished_ids) + batch_size - 1) // batch_size
+                    
+                    for batch_num, i in enumerate(range(0, len(non_finished_ids), batch_size), 1):
+                        batch = non_finished_ids[i:i + batch_size]
+                        processed = min(i + batch_size, len(non_finished_ids))
+                        progress = (i / len(non_finished_ids)) * 100
                         
                         logger.info(f"Processando lote {batch_num}/{total_batches} - "
-                                    f"Animes: {processed}/{total_animes} ({progress:.1f}%)")
+                                  f"Animes: {processed}/{len(non_finished_ids)} ({progress:.1f}%)")
                         
-                        # Use ThreadPoolExecutor with a single worker to avoid overwhelming the API
                         with ThreadPoolExecutor(max_workers=1) as executor:
-                            # Atualiza os animes e captura os resultados
-                            results = []
-                            for mid in batch:
-                                result = update_anime(mid, conn, error_ids)
-                                if result:
-                                    if result['is_new']:
-                                        added_count += 1
-                                        new_animes.append({
-                                            'mal_id': mid,
-                                            'title': result.get('title', 'Sem título')
-                                        })
-                                    else:
-                                        updated_count += 1
-                                results.append(result)
-
-                logger.info(f"Update cycle completed. Updated {updated_count} animes. "
-                            f"Added {added_count} animes. Errors: {len(error_ids)}")
+                            updated_count += process_anime_batch(conn, batch, error_ids)
+                    
+                    logger.info(f"Atualização concluída. Animes atualizados: {updated_count}")
+                
+                logger.info(f"Ciclo de atualização concluído. Animes atualizados: {updated_count}. "
+                          f"Erros: {len(error_ids)}")
+                
                 # Envia notificação para o Discord
-                send_discord_notification(updated_count, added_count, error_ids, new_animes)
+                send_discord_notification(updated_count, error_ids, [])
                 
                 # Reseta os contadores para o próximo ciclo
                 updated_count = 0
-                added_count = 0
                 error_ids = []
-                new_animes = []
                 
             finally:
                 # Libera a conexão de volta para o pool
@@ -607,11 +552,11 @@ def main():
             time.sleep(30 * 60)  # 30 minutes in seconds
     except KeyboardInterrupt:
         logger.info("Script interrompido pelo usuário. Enviando notificação final...")
-        send_discord_notification(updated_count, added_count, error_ids, new_animes)
+        send_discord_notification(updated_count, error_ids)
         logger.info("Saindo...")
     except Exception as e:
         logger.error(f"Erro no loop principal: {e}", exc_info=True)
-        send_discord_notification(updated_count, added_count, error_ids, new_animes)
+        send_discord_notification(updated_count, error_ids)
         raise
 
 # Variável global para o pool de conexões
