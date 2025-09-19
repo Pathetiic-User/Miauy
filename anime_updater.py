@@ -1,9 +1,11 @@
 import psycopg2
+from psycopg2.pool import SimpleConnectionPool
 import requests
 import json
 from datetime import datetime, timezone
 import time
 import os
+import atexit
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -349,20 +351,67 @@ def send_discord_notification(updated_count, error_ids):
     except Exception as e:
         logger.error("Erro ao enviar notificação para o Discord", exc_info=True)
 
-def get_db_connection():
-    """Estabelece uma nova conexão com o banco de dados"""
+# Configuração do pool de conexões
+def init_connection_pool():
+    """Inicializa o pool de conexões"""
     database_url = os.getenv('DATABASE_URL')
     if not database_url:
         raise ValueError("A variável de ambiente DATABASE_URL não está definida no arquivo .env")
+    
     try:
-        conn = psycopg2.connect(database_url)
-        logger.info("Nova conexão com o banco de dados estabelecida com sucesso")
-        return conn
+        # Pool com 1 a 10 conexões
+        pool = SimpleConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=database_url,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5
+        )
+        logger.info("Pool de conexões inicializado com sucesso")
+        return pool
     except psycopg2.Error as e:
-        logger.error(f"Erro ao conectar ao banco de dados: {e}", exc_info=True)
+        logger.error(f"Erro ao inicializar o pool de conexões: {e}")
         raise
 
+def get_db_connection():
+    """Obtém uma conexão do pool"""
+    try:
+        conn = conn_pool.getconn()
+        conn.autocommit = False
+        return conn
+    except Exception as e:
+        logger.error(f"Erro ao obter conexão do pool: {e}")
+        raise
+
+def release_db_connection(conn):
+    """Libera uma conexão de volta para o pool"""
+    if conn:
+        try:
+            if not conn.closed:
+                conn.rollback()  # Garante que não há transações pendentes
+            conn_pool.putconn(conn)
+        except Exception as e:
+            logger.error(f"Erro ao liberar conexão para o pool: {e}")
+
+def close_all_connections():
+    """Fecha todas as conexões do pool"""
+    global conn_pool
+    if conn_pool:
+        logger.info("Fechando todas as conexões do pool...")
+        conn_pool.closeall()
+        logger.info("Todas as conexões foram fechadas")
+
 def main():
+    global conn_pool
+    
+    # Inicializa o pool de conexões
+    conn_pool = init_connection_pool()
+    
+    # Garante que as conexões serão fechadas ao sair
+    atexit.register(close_all_connections)
+    
     # Envia notificação de inicialização
     send_startup_notification()
     
@@ -372,10 +421,10 @@ def main():
 
     try:
         while True:
-            # Estabelece nova conexão para o ciclo
-            conn = get_db_connection()
-            
+            # Obtém uma conexão do pool
+            conn = None
             try:
+                conn = get_db_connection()
                 # Fetch all mal_ids from the table
                 with conn.cursor() as cur:
                     cur.execute("SELECT mal_id FROM public.animes")
@@ -417,20 +466,28 @@ def main():
                 error_ids = []
                 
             finally:
-                # Fecha a conexão ao final do ciclo
+                # Libera a conexão de volta para o pool
                 if conn:
-                    conn.close()
-                    logger.info("Conexão com o banco de dados fechada")
+                    release_db_connection(conn)
             
             time.sleep(30 * 60)  # 30 minutes in seconds
     except KeyboardInterrupt:
-        logger.info("Script interrupted. Sending final notification...")
+        logger.info("Script interrompido pelo usuário. Enviando notificação final...")
         send_discord_notification(updated_count, error_ids)
-        logger.info("Exiting.")
+        logger.info("Saindo...")
     except Exception as e:
-        logger.error(f"Error in main loop: {e}", exc_info=True)
+        logger.error(f"Erro no loop principal: {e}", exc_info=True)
         send_discord_notification(updated_count, error_ids)
         raise
 
+# Variável global para o pool de conexões
+conn_pool = None
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.critical(f"Erro fatal: {e}", exc_info=True)
+        if 'conn_pool' in globals() and conn_pool:
+            close_all_connections()
+        raise
