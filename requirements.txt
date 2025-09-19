@@ -1,22 +1,46 @@
-discord.py>=2.3.2
+# Core
 python-dotenv>=1.0.0
 requests>=2.31.0
-psycopg2>=2.9.10
-deep-translator>=1.11.4
+urllib3>=2.0.0
+
+# Database
+psycopg2-binary>=2.9.9
+psycopg2-pool>=1.1
+asyncpg>=0.30.0
+
+# Discord
+discord.py>=2.3.2
+PyNaCl>=1.5.0
+
+# Async
+aiohttp>=3.9.0
+aiosignal>=1.4.0
+asyncio>=3.4.3
+
+# Utils
 tqdm>=4.66.1
 jsonschema>=4.20.0
-PyNaCl
-aiohttp>=3.9.0
-aiohappyeyeballs>=2.5.0
-aiosignal>=1.4.0
-attrs>=23.2.0
+backoff>=2.2.1
+python-dateutil>=2.8.2
+
+# Web
+flask>=2.3.3
+flask-cors>=4.0.0
+
+# Scheduler
+apscheduler>=3.10.1
+
+# Translation
+deep-translator>=1.11.4
+
+# Performance
+psutil>=7.0.0
 frozenlist>=1.4.0
 multidict>=6.0.0
-propcache>=0.2.0
 yarl>=1.9.0
-psutil>=7.0.0
-argparse>=1.4.0
-backoff>=2.2.1
-psycopg2-pool>=1.1
-flask>=2.3.3
-apscheduler>=3.10.1
+
+# Dependencies
+attrs>=23.2.0
+certifi>=2023.7.22
+charset-normalizer>=3.3.2
+idna>=3.4
